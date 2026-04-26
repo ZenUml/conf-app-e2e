@@ -1,0 +1,111 @@
+name: External E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Private repo (owner/repo)'
+        type: string
+        required: true
+      source_sha:
+        description: 'Commit SHA to report status on'
+        type: string
+        required: true
+      pr_number:
+        description: 'PR number (optional)'
+        type: string
+        required: false
+        default: ''
+      app:
+        description: 'App profile, e.g. zenuml-lite@stg'
+        type: string
+        required: true
+      suite:
+        description: 'Test suite: all, insert, render'
+        type: string
+        required: false
+        default: 'insert'
+
+jobs:
+  e2e:
+    name: "E2E: ${{ inputs.app }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Set status → pending
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_STATUS_TOKEN }}
+        run: |
+          gh api --method POST \
+            "/repos/${{ inputs.source_repo }}/statuses/${{ inputs.source_sha }}" \
+            -f state=pending \
+            -f context="external-e2e/${{ inputs.app }}" \
+            -f description="Running on public runner" \
+            -f target_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.x
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24.x'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: pw-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-pw-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install Playwright browsers
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run tests
+        id: tests
+        run: |
+          case "${{ inputs.suite }}" in
+            insert)  pnpm test:insert ;;
+            render)  pnpm test:render ;;
+            *)       pnpm test ;;
+          esac
+        env:
+          APP: ${{ inputs.app }}
+          CI: true
+          ZENUML_STAGE_USERNAME: ${{ secrets.ZENUML_STAGE_USERNAME }}
+          ZENUML_STAGE_PASSWORD: ${{ secrets.ZENUML_STAGE_PASSWORD }}
+          ATLASSIAN_OTP: ${{ secrets.ATLASSIAN_OTP }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ inputs.app }}
+          path: playwright-report/
+
+      - name: Report final status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_STATUS_TOKEN }}
+          OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          if [ "$OUTCOME" = "success" ]; then
+            STATE=success DESC="E2E passed"
+          else
+            STATE=failure DESC="E2E failed"
+          fi
+          gh api --method POST \
+            "/repos/${{ inputs.source_repo }}/statuses/${{ inputs.source_sha }}" \
+            -f state="$STATE" \
+            -f context="external-e2e/${{ inputs.app }}" \
+            -f description="$DESC" \
+            -f target_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
